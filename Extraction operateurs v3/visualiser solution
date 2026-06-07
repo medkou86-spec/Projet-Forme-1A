@@ -1,0 +1,41 @@
+import pyvista as pv
+import numpy as np
+solution = pv.read("solution.vtu")
+mesh = pv.read("mesh.vtu")
+
+print(solution)
+print("Champs disponibles :", solution.point_data.keys())
+field = "u_abs"   # tu peux mettre "u_abs" ou "u_imag"
+scale_factor = 0.5
+solution_3d = solution.warp_by_scalar(field, factor=scale_factor)
+mesh_base = mesh.copy()
+
+# On récupère les hauteurs min/max de la surface 3D
+z_min = solution_3d.points[:, 2].min()
+z_max = solution_3d.points[:, 2].max()
+
+# On place le maillage un peu en dessous de la surface
+height = z_max - z_min
+base_z = z_min - 0.3 * height
+
+# On force tous les points du maillage à être sur le plan z = base_z
+mesh_base.points[:, 2] = base_z
+plotter = pv.Plotter()
+plotter.add_mesh(
+    solution_3d,
+    scalars=field,
+    cmap="viridis",
+    opacity=1.0,
+    show_edges=False,
+    smooth_shading=True)
+plotter.add_mesh(
+    mesh_base,
+    color="black",
+    style="wireframe",
+    line_width=1)
+
+plotter.add_title(f"Surface 3D de {field} avec maillage 2D")
+plotter.add_axes()
+plotter.view_isometric()
+
+plotter.show()

@@ -1,0 +1,178 @@
+import numpy as np
+import ufl
+from mpi4py import MPI
+from petsc4py import PETSc
+from dolfinx import mesh, fem
+from dolfinx.fem.petsc import assemble_matrix, assemble_vector
+import scipy.sparse as sp
+from scipy.io import mmwrite
+from scipy.sparse.linalg import gcrotmk
+
+# Paramètre complexe
+k = 8 -2j
+# Maillage
+domain = mesh.create_unit_square(MPI.COMM_WORLD, 80, 80)
+tdim = domain.topology.dim
+fdim = tdim - 1
+# Bords
+def left(x):
+    return np.isclose(x[0], 0.0)
+
+def right(x):
+    return np.isclose(x[0], 1.0)
+facets_left = mesh.locate_entities_boundary(domain, fdim, left)
+facets_right = mesh.locate_entities_boundary(domain, fdim, right)
+facet_indices = np.hstack([facets_left, facets_right]).astype(np.int32)
+facet_markers = np.hstack([
+    np.full(len(facets_left), 1, dtype=np.int32),
+    np.full(len(facets_right), 2, dtype=np.int32),])
+perm = np.argsort(facet_indices)
+facet_tag = mesh.meshtags(
+    domain,
+    fdim,
+    facet_indices[perm],
+    facet_markers[perm]
+)
+
+dx = ufl.dx(domain)
+ds = ufl.Measure("ds", domain=domain, subdomain_data=facet_tag)
+# Espace éléments finis complexe
+V = fem.functionspace(domain, ("Lagrange", 1))
+u = ufl.TrialFunction(V)
+v = ufl.TestFunction(V)
+# Données du problème
+f = fem.Constant(domain, PETSc.ScalarType(0.0 + 0.0j))
+f_R = fem.Constant(domain, PETSc.ScalarType(0.0 + 0.0j))
+g = PETSc.ScalarType(1.0 + 0.0j)
+# Formes séparées
+#
+# K = ∫ grad(u).grad(conj(v)) dx
+# M = ∫ u conj(v) dx
+# R = ∫_GammaR u conj(v) ds
+#
+# A = K - k² M + i k R
+a_K = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx
+a_M = ufl.inner(u, v) * dx
+a_R = ufl.inner(u, v) * ds(2)
+L_F = f * ufl.conj(v) * dx
+L_FR = f_R * ufl.conj(v) * ds(2)
+# Assemblage séparé des matrices et vecteurs
+K_petsc = assemble_matrix(fem.form(a_K))
+K_petsc.assemble()
+M_petsc = assemble_matrix(fem.form(a_M))
+M_petsc.assemble()
+R_petsc = assemble_matrix(fem.form(a_R))
+R_petsc.assemble()
+F_petsc = assemble_vector(fem.form(L_F))
+FR_petsc = assemble_vector(fem.form(L_FR))
+# Conversion PETSc -> SciPy
+def petsc_mat_to_csr(A_petsc):
+    indptr, indices, data = A_petsc.getValuesCSR()
+    return sp.csr_matrix((data, indices, indptr), shape=A_petsc.getSize())
+def petsc_vec_to_numpy(b_petsc):
+    return b_petsc.array.copy()
+K = petsc_mat_to_csr(K_petsc)
+M = petsc_mat_to_csr(M_petsc)
+R = petsc_mat_to_csr(R_petsc)
+F = petsc_vec_to_numpy(F_petsc)
+FR = petsc_vec_to_numpy(FR_petsc)
+# Sauvegarde des opérateurs au format .mtx
+if MPI.COMM_WORLD.rank == 0:
+
+    mmwrite("K.mtx", K)
+    mmwrite("M.mtx", M)
+    mmwrite("R.mtx", R)
+
+    mmwrite("F.mtx", F.reshape(-1, 1))
+    mmwrite("FR.mtx", FR.reshape(-1, 1))
+# Construction du système global naturel
+#
+# A = K - k² M + i k R
+# B = F + FR
+A = K - (k**2) * M + (1j * k) * R
+B = F + FR
+# Condition de Dirichlet à gauche : u = 1
+
+dofs_left = fem.locate_dofs_topological(V, fdim, facets_left)
+def apply_dirichlet_strong(A, b, dofs, value):
+    """
+    Imposition forte de Dirichlet.
+
+    Pour chaque ddl imposé :
+        u[dof] = value
+
+    On modifie le système algébrique :
+        A u = b
+
+    de façon à garder la condition imposée exactement.
+    """
+    A = A.tolil(copy=True)
+    b = b.copy()
+    for dof in np.array(dofs, dtype=int):
+        # Correction du second membre avant suppression de la colonne
+        col = A[:, dof].toarray().ravel()
+        b -= col * value
+        # Suppression ligne et colonne
+        A[:, dof] = 0.0
+        A[dof, :] = 0.0
+        # Imposition directe
+        A[dof, dof] = 1.0
+        b[dof] = value
+    return A.tocsr(), b
+A_bc, B_bc = apply_dirichlet_strong(
+    A,
+    B,
+    dofs_left,
+    1.0 + 0.0j
+)
+# Sauvegarde du système final réellement résolu
+if MPI.COMM_WORLD.rank == 0:
+    mmwrite("A_final.mtx", A_bc)
+    mmwrite("B_final.mtx", B_bc.reshape(-1, 1))
+# Résolution avec gcrotmk
+if MPI.COMM_WORLD.rank == 0:
+    U, info = gcrotmk(
+        A_bc,
+        B_bc,
+        rtol=1e-10,
+        atol=0.0,
+        maxiter=2000
+    )
+    if info == 0:
+        print("Convergence OK avec gcrotmk.")
+    else:
+        print("Attention : gcrotmk n'a pas totalement convergé.")
+        print("info =", info)
+
+    mmwrite("U_sol.mtx", U.reshape(-1, 1))
+# ============================================================
+# Export VTK / VTU + visualisation PyVista
+# ============================================================
+from dolfinx import plot
+import pyvista as pv
+
+
+if MPI.COMM_WORLD.rank == 0:
+
+    topology, cell_types, geometry = plot.vtk_mesh(V)
+
+    grid = pv.UnstructuredGrid(topology, cell_types, geometry)
+
+    u_real = np.real(U)
+    u_imag = np.imag(U)
+    u_abs = np.abs(U)
+
+    grid.point_data["u_real"] = u_real
+    grid.point_data["u_imag"] = u_imag
+    grid.point_data["u_abs"] = u_abs
+
+    mesh_grid = pv.UnstructuredGrid(topology, cell_types, geometry)
+    mesh_grid.save("mesh.vtu")
+
+    grid.save("solution.vtu")
+
+    print("Fichiers VTK sauvegardés :")
+    print(" - mesh.vtu")
+    print(" - solution.vtu")
+
+   
