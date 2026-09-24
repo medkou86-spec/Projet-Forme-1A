@@ -4,262 +4,117 @@ import matplotlib.tri as mtri
 import ufl
 
 from mpi4py import MPI
-from dolfinx import mesh, fem, default_scalar_type
+from petsc4py import PETSc
+from dolfinx import mesh, fem
 from dolfinx.fem.petsc import LinearProblem
-from basix.ufl import element, mixed_element
 
-
-
-k = 8.0
-
+# Paramètre complexe (géré nativement)
+k = 8 - 2j
 
 # ============================================================
 # Maillage du carré [0,1]x[0,1]
 # ============================================================
-
 domain = mesh.create_unit_square(MPI.COMM_WORLD, 80, 80)
-
 tdim = domain.topology.dim
 fdim = tdim - 1
 
-
 # ============================================================
-# Définition des bords
+# Bords
 # ============================================================
-
-def left(x):
-    return np.isclose(x[0], 0.0)
-
-def right(x):
-    return np.isclose(x[0], 1.0)
-
-def bottom(x):
-    return np.isclose(x[1], 0.0)
-
-def top(x):
-    return np.isclose(x[1], 1.0)
-
+def left(x): return np.isclose(x[0], 0)
+def right(x): return np.isclose(x[0], 1)
+def bottom(x): return np.isclose(x[1], 0)
+def top(x): return np.isclose(x[1], 1)
 
 facets_left = mesh.locate_entities_boundary(domain, fdim, left)
 facets_right = mesh.locate_entities_boundary(domain, fdim, right)
 facets_bottom = mesh.locate_entities_boundary(domain, fdim, bottom)
 facets_top = mesh.locate_entities_boundary(domain, fdim, top)
 
-
-# ============================================================
-# Marquage des frontières
-#
-# 1 : gauche
-# 2 : droite
-# 3 : bas
-# 4 : haut
-# ============================================================
-
-facet_indices = np.hstack(
-    [
-        facets_left,
-        facets_right,
-        facets_bottom,
-        facets_top,
-    ]
-).astype(np.int32)
-
-facet_markers = np.hstack(
-    [
-        np.full(len(facets_left), 1, dtype=np.int32),
-        np.full(len(facets_right), 2, dtype=np.int32),
-        np.full(len(facets_bottom), 3, dtype=np.int32),
-        np.full(len(facets_top), 4, dtype=np.int32),
-    ]
-)
+facet_indices = np.hstack([facets_left, facets_right, facets_bottom, facets_top]).astype(np.int32)
+facet_markers = np.hstack([
+    np.full(len(facets_left), 1, dtype=np.int32),
+    np.full(len(facets_right), 2, dtype=np.int32),
+    np.full(len(facets_bottom), 3, dtype=np.int32),
+    np.full(len(facets_top), 4, dtype=np.int32),
+])
 
 perm = np.argsort(facet_indices)
-
-facet_tag = mesh.meshtags(
-    domain,
-    fdim,
-    facet_indices[perm],
-    facet_markers[perm],
-)
+facet_tag = mesh.meshtags(domain, fdim, facet_indices[perm], facet_markers[perm])
 
 dx = ufl.dx(domain)
 ds = ufl.Measure("ds", domain=domain, subdomain_data=facet_tag)
 
-
 # ============================================================
-# Espace mixte réel
-#
-# u = ur + i ui
+# Espace complexe unifié
 # ============================================================
-
-P1 = element("Lagrange", domain.basix_cell(), 1)
-
-W = fem.functionspace(
-    domain,
-    mixed_element([P1, P1])
-)
-
+V = fem.functionspace(domain, ("Lagrange", 1))
 
 # ============================================================
 # Inconnues et fonctions tests
 # ============================================================
-
-(ur, ui) = ufl.TrialFunctions(W)
-(vr, vi) = ufl.TestFunctions(W)
-
+u = ufl.TrialFunction(V)
+v = ufl.TestFunction(V)
 
 # ============================================================
-# Formulation faible réelle
+# Formulation faible complexe unifiée (Myers modifiée)
 #
-# Problème fort :
-#
-# Δu + k²u = 0 dans Omega
-#
-# Conditions :
-#
-# u = 1 à gauche
-# ∂n u = 0 en haut et en bas
-# ∂n u + i k u + ∂²u/∂y² = 0 à droite
-#
-# Avec u = ur + i ui :
-#
-# Re :
-# ∂n ur - k ui + ∂²ur/∂y² = 0
-#
-# Im :
-# ∂n ui + k ur + ∂²ui/∂y² = 0
-#
-# Après intégration par parties :
-#
-# Re :
-# ∫ grad(ur).grad(vr) dx
-# - k² ∫ ur vr dx
-# - k ∫ ui vr ds(R)
-# - ∫ d_y(ur) d_y(vr) ds(R)
-#
-# Im :
-# ∫ grad(ui).grad(vi) dx
-# - k² ∫ ui vi dx
-# + k ∫ ur vi ds(R)
-# - ∫ d_y(ui) d_y(vi) ds(R)
+# sur Gamma_R : ∂n u + i k u + ∂²u/∂y² = 0
+# Intégration par parties => - ufl.grad(u)[1] * ufl.grad(v)[1]
 # ============================================================
-
 a = (
-    # Partie réelle
-    ufl.inner(ufl.grad(ur), ufl.grad(vr)) * dx
-    - (k**2) * ur * vr * dx
-    - k * ui * vr * ds(2)
-    - ufl.grad(ur)[1] * ufl.grad(vr)[1] * ds(2)
-
-    # Partie imaginaire
-    + ufl.inner(ufl.grad(ui), ufl.grad(vi)) * dx
-    - (k**2) * ui * vi * dx
-    + k * ur * vi * ds(2)
-    - ufl.grad(ui)[1] * ufl.grad(vi)[1] * ds(2)
+    ufl.inner(ufl.grad(u), ufl.grad(v)) * dx
+    - (k**2) * ufl.inner(u, v) * dx
+    + 1j * k * ufl.inner(u, v) * ds(2)
+    # Dérivée seconde tangentielle selon l'axe y
+    - ufl.inner(ufl.grad(u)[1], ufl.grad(v)[1]) * ds(2)
 )
 
-L = fem.Constant(domain, default_scalar_type(0.0)) * (vr + vi) * dx
-
+L = fem.Constant(domain, PETSc.ScalarType(0.0)) * ufl.conj(v) * dx
 
 # ============================================================
 # Conditions de Dirichlet à gauche
-#
-# u = 1
-#
-# donc :
-# ur = 1
-# ui = 0
 # ============================================================
+dofs_left = fem.locate_dofs_topological(V, fdim, facets_left)
+bc = fem.dirichletbc(PETSc.ScalarType(1.0 + 0.0j), dofs_left, V)
 
-dofs_r = fem.locate_dofs_topological(W.sub(0), fdim, facets_left)
-dofs_i = fem.locate_dofs_topological(W.sub(1), fdim, facets_left)
-
-bc_r = fem.dirichletbc(
-    default_scalar_type(1.0),
-    dofs_r,
-    W.sub(0),
-)
-
-bc_i = fem.dirichletbc(
-    default_scalar_type(0.0),
-    dofs_i,
-    W.sub(1),
-)
-
-bcs = [bc_r, bc_i]
-
+bcs = [bc]
 
 # ============================================================
-# Résolution avec LinearProblem
+# Résolution
 # ============================================================
-
 problem = LinearProblem(
     a,
     L,
     bcs=bcs,
-    petsc_options_prefix="helmholtz_modified",
+    petsc_options_prefix="helmholtz_myers",
     petsc_options={
         "ksp_type": "preonly",
-        "pc_type": "lu",
-    },
+        "pc_type": "lu"
+    }
 )
-
 uh = problem.solve()
-
-
-# ============================================================
-# Extraction de ur et ui
-# ============================================================
-
-V0, map_r = W.sub(0).collapse()
-V1, map_i = W.sub(1).collapse()
-
-ur_h = fem.Function(V0)
-ui_h = fem.Function(V1)
-
-ur_h.x.array[:] = uh.x.array[map_r]
-ui_h.x.array[:] = uh.x.array[map_i]
-
-
-# ============================================================
-# Calcul du module |u|
-# ============================================================
-
-uabs_h = fem.Function(V0)
-uabs_h.x.array[:] = np.sqrt(
-    ur_h.x.array[:] ** 2
-    +
-    ui_h.x.array[:] ** 2
-)
-
-
 
 # ============================================================
 # Préparation de la visualisation
 # ============================================================
-
 if MPI.COMM_WORLD.rank == 0:
-
-    coords = V0.tabulate_dof_coordinates()[:, :2]
+    coords = V.tabulate_dof_coordinates()[:, :2]
 
     domain.topology.create_connectivity(tdim, 0)
     cells = domain.topology.connectivity(tdim, 0).array.reshape((-1, 3))
 
-    triang = mtri.Triangulation(
-        coords[:, 0],
-        coords[:, 1],
-        cells,
-    )
+    triang = mtri.Triangulation(coords[:, 0], coords[:, 1], cells)
 
-    ur_vals = ur_h.x.array
-    ui_vals = ui_h.x.array
-    uabs_vals = np.sqrt(ur_vals**2 + ui_vals**2)
+    # Extraction directe depuis le tableau complexe
+    u_vals = uh.x.array
+    ur_vals = np.real(u_vals)
+    ui_vals = np.imag(u_vals)
+    uabs_vals = np.abs(u_vals)
 
-
-    # ========================================================
+    # ============================
     # Visualisation 2D
-    # ========================================================
-
+    # ============================
     fig2d, axes = plt.subplots(1, 3, figsize=(16, 4.8))
 
     c0 = axes[0].tricontourf(triang, ur_vals, levels=50)
@@ -285,22 +140,14 @@ if MPI.COMM_WORLD.rank == 0:
 
     plt.tight_layout()
 
-
-    # ========================================================
+    # ============================
     # Visualisation 3D
-    # ========================================================
-
+    # ============================
     fig3d = plt.figure(figsize=(18, 5))
 
     ax1 = fig3d.add_subplot(131, projection="3d")
-    s1 = ax1.plot_trisurf(
-        coords[:, 0],
-        coords[:, 1],
-        ur_vals,
-        triangles=cells,
-        cmap="viridis",
-        linewidth=0.1,
-    )
+    s1 = ax1.plot_trisurf(coords[:, 0], coords[:, 1], ur_vals,
+                          triangles=cells, cmap="viridis", linewidth=0.1)
     ax1.set_title("Surface 3D Re(u)")
     ax1.set_xlabel("x")
     ax1.set_ylabel("y")
@@ -308,14 +155,8 @@ if MPI.COMM_WORLD.rank == 0:
     fig3d.colorbar(s1, ax=ax1, shrink=0.6)
 
     ax2 = fig3d.add_subplot(132, projection="3d")
-    s2 = ax2.plot_trisurf(
-        coords[:, 0],
-        coords[:, 1],
-        ui_vals,
-        triangles=cells,
-        cmap="plasma",
-        linewidth=0.1,
-    )
+    s2 = ax2.plot_trisurf(coords[:, 0], coords[:, 1], ui_vals,
+                          triangles=cells, cmap="plasma", linewidth=0.1)
     ax2.set_title("Surface 3D Im(u)")
     ax2.set_xlabel("x")
     ax2.set_ylabel("y")
@@ -323,14 +164,8 @@ if MPI.COMM_WORLD.rank == 0:
     fig3d.colorbar(s2, ax=ax2, shrink=0.6)
 
     ax3 = fig3d.add_subplot(133, projection="3d")
-    s3 = ax3.plot_trisurf(
-        coords[:, 0],
-        coords[:, 1],
-        uabs_vals,
-        triangles=cells,
-        cmap="inferno",
-        linewidth=0.1,
-    )
+    s3 = ax3.plot_trisurf(coords[:, 0], coords[:, 1], uabs_vals,
+                          triangles=cells, cmap="inferno", linewidth=0.1)
     ax3.set_title("Surface 3D |u|")
     ax3.set_xlabel("x")
     ax3.set_ylabel("y")
